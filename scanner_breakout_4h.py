@@ -1,431 +1,410 @@
 import ccxt
 import pandas as pd
-import numpy as np
 import time
-from collections import Counter
+import math
+from datetime import datetime
 
 # =========================
-# CONFIG (kolay ayar)
+# CONFIG
 # =========================
 CONFIG = {
     "timeframe": "4h",
-    "limit": 260,
+    "limit": 250,                 # candle count
+    "max_pairs": 250,             # how many USDT pairs to scan
+    "min_price": 0.0000001,       # ignore near-zero
+    "min_quote_volume_usdt": 2_000_000,  # 24h quoteVolume filter (approx)
+    "sleep_ms": 120,              # polite pacing
+    "top_n": 10,                  # print top N
+    "save_csv": True,
+    "csv_name": "scan_results.csv",
 
-    # Universe
-    "max_symbols": 250,
-    "min_bars": 220,
-
-    # Market filters (kalite)
-    "exclude_bases": {"USDT", "USDC", "FDUSD", "TUSD", "DAI", "BUSD"},
-    "min_price": 0.000001,   # mikro fiyatlı çöp elemek için
-    "min_volume_usdt_approx": 0,  # spotta 24h volume için ayrı endpoint gerek; burada 0 bırakıyoruz.
-
-    # Strategy filters
-    "ema_trend": 200,
+    # Trend filters
+    "ema_len": 200,
     "rsi_len": 14,
-    "adx_len": 14,
     "atr_len": 14,
 
-    # Breakout logic
-    "pivot_left": 2,
-    "pivot_right": 2,
-    "pivot_lookback": 80,     # son kaç bar içinde pivotlardan direnç çıkaralım
-    "breakout_atr_mult": 0.25, # close > R + (ATR * mult) (fake breakout azaltma)
-    "min_vol_ratio": 1.3,      # son hacim / 20 SMA hacim
-    "vol_sma_len": 20,
+    # Breakout rules
+    "pivot_lookback": 60,         # to find pivot high/low levels
+    "break_buffer_atr": 0.15,     # breakout needs close beyond level by X*ATR
+    "max_atr_pct": 8.0,           # avoid too wild coins (ATR% too high)
+    "min_vol_ratio": 1.2,         # volume confirmation: last vol / SMA(vol) >= ratio
 
-    # Extra quality filters
-    "rsi_min": 48,
-    "rsi_max": 72,
-    "adx_min": 14,
-    "atrp_min": 0.6,          # ATR% çok düşükse (ölü piyasa) kırılım zayıf olabilir
-    "atrp_max": 8.0,          # ATR% çok yüksekse noise olabilir
-
-    # Scoring weights (toplam 100 civarı)
-    "w_trend": 20,
-    "w_breakout": 25,
-    "w_volume": 15,
-    "w_momentum": 15,
-    "w_adx": 15,
-    "w_structure": 10,  # formasyon / yapı
+    # Compression rules (B seçeneği)
+    "compression_window": 24,     # last N candles range width check
+    "compression_width_pct": 3.0, # if (hi-lo)/mid*100 <= this => compression
+    "near_break_distance_atr": 0.35,  # if price near key level within X*ATR => "about to break"
 }
 
 # =========================
-# Indicators
+# INDICATORS
 # =========================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def ema(series: pd.Series, n: int):
+    return series.ewm(span=n, adjust=False).mean()
 
-def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+def rsi(close: pd.Series, n: int = 14):
     delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(length).mean()
-    avg_loss = loss.rolling(length).mean().replace(0, np.nan)
-    rs = avg_gain / avg_loss
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(method="bfill")
+    gain = (delta.where(delta > 0, 0.0)).rolling(n).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(n).mean()
+    rs = gain / (loss.replace(0, 1e-12))
+    return 100 - (100 / (1 + rs))
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
+def atr(df: pd.DataFrame, n: int = 14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(length).mean()
+    return tr.rolling(n).mean()
 
-def wilder_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-
-    up_move = high.diff()
-    down_move = low.shift() - low
-
-    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr_sm = tr.ewm(alpha=1/period, adjust=False).mean()
-    plus_sm = plus_dm.ewm(alpha=1/period, adjust=False).mean()
-    minus_sm = minus_dm.ewm(alpha=1/period, adjust=False).mean()
-
-    plus_di = 100 * (plus_sm / atr_sm)
-    minus_di = 100 * (minus_sm / atr_sm)
-
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di)) * 100
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return adx
+def vol_sma(vol: pd.Series, n: int = 20):
+    return vol.rolling(n).mean()
 
 # =========================
-# Pivots & structures
+# STRUCTURE / PATTERNS
 # =========================
-def pivot_idxs(series: pd.Series, left: int, right: int, mode: str):
-    vals = series.values
-    idxs = []
-    for i in range(left, len(vals) - right):
-        L = vals[i-left:i]
-        R = vals[i+1:i+1+right]
-        if mode == "high":
-            if vals[i] >= np.max(L) and vals[i] >= np.max(R):
-                idxs.append(i)
-        else:
-            if vals[i] <= np.min(L) and vals[i] <= np.min(R):
-                idxs.append(i)
-    return idxs
-
-def last_pivot_resistance(df: pd.DataFrame, lookback: int, left: int, right: int):
-    sub = df.iloc[-lookback:].copy()
-    idxs = pivot_idxs(sub["high"], left, right, "high")
-    if not idxs:
-        return None
-    # en son pivot high
-    i = idxs[-1]
-    return float(sub["high"].iloc[i])
-
-def last_pivot_support(df: pd.DataFrame, lookback: int, left: int, right: int):
-    sub = df.iloc[-lookback:].copy()
-    idxs = pivot_idxs(sub["low"], left, right, "low")
-    if not idxs:
-        return None
-    i = idxs[-1]
-    return float(sub["low"].iloc[i])
-
-def detect_triangle(df: pd.DataFrame, lookback: int, left: int, right: int):
-    sub = df.iloc[-lookback:].copy()
-    ph = pivot_idxs(sub["high"], left, right, "high")
-    pl = pivot_idxs(sub["low"], left, right, "low")
-    if len(ph) < 3 or len(pl) < 3:
-        return False
-
-    highs = [float(sub["high"].iloc[i]) for i in ph[-3:]]
-    lows  = [float(sub["low"].iloc[i])  for i in pl[-3:]]
-
-    lower_highs = highs[0] > highs[1] > highs[2]
-    higher_lows = lows[0] < lows[1] < lows[2]
-    return bool(lower_highs and higher_lows)
-
-def detect_range(df: pd.DataFrame, window: int = 60):
-    sub = df.iloc[-window:].copy()
-    hi = sub["high"].max()
-    lo = sub["low"].min()
-    mid = (hi + lo) / 2
-    width_pct = (hi - lo) / mid * 100 if mid else 999
-    # 60 bar içinde bant çok dar ise range
-    return width_pct < 8.0
-
-def detect_flag_channel(df: pd.DataFrame, impulse_bars: int = 12, cons_bars: int = 30):
-    # Basit: önce güçlü yükseliş (impuls), sonra dar bant (konsolidasyon)
-    if len(df) < impulse_bars + cons_bars + 5:
-        return False
-
-    imp = df.iloc[-(impulse_bars + cons_bars):-cons_bars]
-    cons = df.iloc[-cons_bars:]
-
-    imp_move = (imp["close"].iloc[-1] - imp["open"].iloc[0]) / imp["open"].iloc[0] * 100
-    cons_hi = cons["high"].max()
-    cons_lo = cons["low"].min()
-    cons_mid = (cons_hi + cons_lo) / 2
-    cons_width = (cons_hi - cons_lo) / cons_mid * 100 if cons_mid else 999
-
-    return (imp_move > 6.0) and (cons_width < 6.0)
-
-def detect_channel_breakout(df: pd.DataFrame, window: int = 50):
-    """Yükselen/alçalan paralel kanal dışına kırılım."""
-    if len(df) < window + 2:
-        return False, None
-
-    sub = df.iloc[-(window + 1):-1]
-    ch_high = float(sub["high"].max())
-    ch_low = float(sub["low"].min())
-    last_close = float(df["close"].iloc[-1])
-
-    channel_width_pct = ((ch_high - ch_low) / ((ch_high + ch_low) / 2)) * 100 if (ch_high + ch_low) != 0 else 999
-    if channel_width_pct > 12:
-        return False, None
-
-    if last_close > ch_high:
-        return True, "channel_breakout_up"
-    if last_close < ch_low:
-        return True, "channel_breakout_down"
-    return False, None
-
-def detect_range_breakout(df: pd.DataFrame, window: int = 60):
-    """Dar banttan çıkış (range breakout)."""
-    if len(df) < window + 2:
-        return False, None, None, None
-
-    sub = df.iloc[-(window + 1):-1]
+def detect_compression(df: pd.DataFrame, window: int, width_pct: float):
+    """B seçeneği: sıkışma/range daralması"""
+    if len(df) < window + 5:
+        return False, None, None
+    sub = df.tail(window)
     hi = float(sub["high"].max())
     lo = float(sub["low"].min())
-    mid = (hi + lo) / 2
-    width_pct = ((hi - lo) / mid) * 100 if mid else 999
-    last_close = float(df["close"].iloc[-1])
+    mid = (hi + lo) / 2 if (hi + lo) != 0 else 1.0
+    width = (hi - lo) / mid * 100.0
+    if width <= width_pct:
+        return True, "compression", {"hi": hi, "lo": lo, "width_pct": width}
+    return False, None, {"hi": hi, "lo": lo, "width_pct": width}
 
-    if width_pct > 8.0:
-        return False, None, hi, lo
+def pivot_levels(df: pd.DataFrame, lookback: int):
+    """Simple pivot: last lookback highs/lows as key levels"""
+    if len(df) < lookback + 5:
+        lookback = max(30, len(df) - 10)
+    sub = df.tail(lookback)
+    pivot_hi = float(sub["high"].max())
+    pivot_lo = float(sub["low"].min())
+    return pivot_hi, pivot_lo
 
-    if last_close > hi:
-        return True, "range_breakout_up", hi, lo
-    if last_close < lo:
-        return True, "range_breakout_down", hi, lo
-
-    return False, None, hi, lo
-
-def volume_confirmation(df: pd.DataFrame, min_ratio: float):
-    if "VOL_RATIO" not in df.columns:
-        return False
-    return float(df["VOL_RATIO"].iloc[-1]) >= min_ratio
+def channel_breakout(df: pd.DataFrame, window: int = 60):
+    """
+    Basit kanal: son window içindeki üst/alt bandı alıp
+    son kapanışın dışarı taşıp taşmadığına bakar.
+    """
+    if len(df) < window + 5:
+        return False, None, None
+    sub = df.tail(window)
+    hi = float(sub["high"].max())
+    lo = float(sub["low"].min())
+    last = df.iloc[-1]
+    close = float(last["close"])
+    return True, (hi, lo), close
 
 # =========================
-# Scoring
+# SCORING
 # =========================
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def score_candidate(df: pd.DataFrame, R: float, S: float, cfg=CONFIG):
+def score_candidate(df: pd.DataFrame, cfg: dict, meta: dict):
+    """
+    meta: {'type':..., 'level':..., 'distance_atr':..., 'compression':..., 'vol_ratio':..., 'atr_pct':...}
+    """
     last = df.iloc[-1]
     price = float(last["close"])
-    ema200 = float(last["EMA"])
+    ema200 = float(last["EMA200"])
     r = float(last["RSI"])
-    a = float(last["ADX"])
     atrv = float(last["ATR"])
     atrp = float(last["ATR_PCT"])
-    vol_ratio = float(last["VOL_RATIO"])
+    vratio = float(last["VOL_RATIO"])
 
-    # Filter gates
+    # Basic gates
     if price <= cfg["min_price"]:
         return None
-
-    if not (price > ema200):
+    if atrp > cfg["max_atr_pct"]:
         return None
 
-    if not (cfg["rsi_min"] <= r <= cfg["rsi_max"]):
+    # Trend weight: prefer above EMA200
+    trend_score = 10 if price >= ema200 else 0
+
+    # RSI zone: prefer 45-70 for longs (not too overbought)
+    rsi_score = 0
+    if 45 <= r <= 70:
+        rsi_score = 15
+    elif 40 <= r < 45:
+        rsi_score = 8
+    elif 70 < r <= 78:
+        rsi_score = 6
+
+    # Volume confirmation
+    vol_score = 0
+    if vratio >= cfg["min_vol_ratio"]:
+        vol_score = 15
+    elif vratio >= 1.05:
+        vol_score = 6
+
+    # Structure / breakout
+    struct_score = 0
+    if meta["type"] in ("pivot_breakout_up", "range_breakout_up", "channel_breakout_up"):
+        struct_score = 25
+    elif meta["type"] in ("near_break_up",):
+        struct_score = 18
+    elif meta["type"] == "compression":
+        struct_score = 14
+
+    # Distance to level (closer is better for "about to break")
+    dist_score = 0
+    if meta.get("distance_atr") is not None:
+        # distance_atr: 0 is perfect, 0.35 is edge of our "near" threshold
+        d = float(meta["distance_atr"])
+        dist_score = int(clamp((1 - d / cfg["near_break_distance_atr"]) * 12, 0, 12))
+
+    # ATR sanity: medium ATR is ok, too low = sleepy, too high = risky
+    atr_quality = 0
+    if 0.7 <= atrp <= 3.5:
+        atr_quality = 8
+    elif 0.4 <= atrp < 0.7:
+        atr_quality = 5
+    elif 3.5 < atrp <= 6.0:
+        atr_quality = 4
+
+    total = trend_score + rsi_score + vol_score + struct_score + dist_score + atr_quality
+    return int(total)
+
+# =========================
+# EXCHANGE / DATA
+# =========================
+def make_exchange():
+    exchange = ccxt.binance({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot",
+            "adjustForTimeDifference": True,
+        },
+        "timeout": 20000,
+    })
+    return exchange
+
+def safe_fetch_ohlcv(exchange, symbol, timeframe, limit, max_retry=4):
+    last_err = None
+    for i in range(max_retry):
+        try:
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except Exception as e:
+            last_err = e
+            # backoff
+            time.sleep(0.8 + i * 1.2)
+    raise last_err
+
+def safe_load_markets(exchange, max_retry=4):
+    last_err = None
+    for i in range(max_retry):
+        try:
+            return exchange.load_markets()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8 + i * 1.2)
+    raise last_err
+
+# =========================
+# MAIN SCAN LOGIC
+# =========================
+def analyze_symbol(df: pd.DataFrame, cfg: dict):
+    # indicators
+    df["EMA200"] = ema(df["close"], cfg["ema_len"])
+    df["RSI"] = rsi(df["close"], cfg["rsi_len"])
+    df["ATR"] = atr(df, cfg["atr_len"])
+    df["ATR_PCT"] = (df["ATR"] / df["close"]) * 100
+    df["VOL_SMA"] = vol_sma(df["volume"], 20)
+    df["VOL_RATIO"] = df["volume"] / (df["VOL_SMA"].replace(0, 1e-12))
+
+    last = df.iloc[-1]
+    price = float(last["close"])
+    atrv = float(last["ATR"]) if not math.isnan(float(last["ATR"])) else 0.0
+
+    # Key levels
+    piv_hi, piv_lo = pivot_levels(df, cfg["pivot_lookback"])
+
+    # Breakout conditions (UP only for now)
+    # pivot breakout up: close > piv_hi + buffer
+    buf = cfg["break_buffer_atr"] * atrv
+    breakout_up = price > (piv_hi + buf)
+
+    # Near-break: within X*ATR below pivot high
+    distance_atr = None
+    near_break = False
+    if atrv > 0:
+        dist = (piv_hi - price) / atrv
+        distance_atr = dist
+        near_break = (0 <= dist <= cfg["near_break_distance_atr"])
+
+    # Channel breakout (simple)
+    ch_ok, ch_levels, ch_close = channel_breakout(df, window=cfg["pivot_lookback"])
+    channel_type = None
+    if ch_ok and ch_levels:
+        ch_hi, ch_lo = ch_levels
+        if price > (ch_hi + buf):
+            channel_type = "channel_breakout_up"
+
+    # Compression (B seçeneği)
+    is_comp, comp_type, comp_info = detect_compression(
+        df, window=cfg["compression_window"], width_pct=cfg["compression_width_pct"]
+    )
+
+    # Decide candidate type
+    cand_type = None
+    level = None
+
+    if breakout_up:
+        cand_type = "pivot_breakout_up"
+        level = piv_hi
+    elif channel_type == "channel_breakout_up":
+        cand_type = "channel_breakout_up"
+        level = ch_levels[0]
+    elif near_break and is_comp:
+        # strongest "about to break": near level + compression
+        cand_type = "near_break_up"
+        level = piv_hi
+    elif is_comp:
+        cand_type = "compression"
+        level = comp_info["hi"] if comp_info else piv_hi
+    elif near_break:
+        cand_type = "near_break_up"
+        level = piv_hi
+
+    if cand_type is None:
         return None
 
-    if not (a >= cfg["adx_min"]):
-        return None
-
-    if not (cfg["atrp_min"] <= atrp <= cfg["atrp_max"]):
-        return None
-
-    if R is None:
-        return None
-
-    breakout_thresh = R + (atrv * cfg["breakout_atr_mult"])
-    breakout_detected = price > breakout_thresh
-
-    tri = detect_triangle(df, lookback=80, left=cfg["pivot_left"], right=cfg["pivot_right"])
-    flag = detect_flag_channel(df)
-    ch_break, ch_tag = detect_channel_breakout(df, window=50)
-    range_break, range_tag, range_hi, range_lo = detect_range_breakout(df, window=60)
-
-    if not (breakout_detected or ch_break or range_break):
-        return None
-
-    vol_confirmed = volume_confirmation(df, cfg["min_vol_ratio"])
-    if not vol_confirmed:
-        return None
-
-    # Scores (0..weight)
-    trend_score = clamp(((price - ema200) / ema200) * 100, 0, 6) / 6 * cfg["w_trend"]
-
-    # breakout ne kadar güçlü (R üstünde ne kadar)
-    breakout_refs = []
-    if R:
-        breakout_refs.append(((price - R) / R) * 100)
-    if range_hi:
-        breakout_refs.append(((price - range_hi) / range_hi) * 100)
-    if ch_break and df.iloc[-2]["high"] > 0:
-        prior_high = float(df.iloc[-2]["high"])
-        breakout_refs.append(((price - prior_high) / prior_high) * 100)
-    breakout_strength_pct = max(breakout_refs) if breakout_refs else 0
-    breakout_score = clamp(breakout_strength_pct, 0, 4) / 4 * cfg["w_breakout"]
-
-    volume_score = clamp(vol_ratio, 1.0, 3.0)
-    volume_score = (volume_score - 1.0) / (3.0 - 1.0) * cfg["w_volume"]
-
-    # momentum: RSI 60 civarı idealdir
-    momentum_score = (1 - (abs(60 - r) / 20))
-    momentum_score = clamp(momentum_score, 0, 1) * cfg["w_momentum"]
-
-    adx_score = clamp(a, cfg["adx_min"], 35)
-    adx_score = (adx_score - cfg["adx_min"]) / (35 - cfg["adx_min"]) * cfg["w_adx"]
-
-    # Structure: triangle / flag / channel / range
-    structure_score = 0
-    tags = []
-    if tri:
-        structure_score += 0.6 * cfg["w_structure"]; tags.append("triangle_pattern")
-    if flag:
-        structure_score += 0.6 * cfg["w_structure"]; tags.append("flag_pattern")
-    if ch_break and ch_tag:
-        structure_score += 0.7 * cfg["w_structure"]; tags.append(ch_tag)
-    if range_break and range_tag:
-        structure_score += 0.7 * cfg["w_structure"]; tags.append(range_tag)
-    elif detect_range(df, window=60):
-        tags.append("range_pattern")
-
-    if breakout_detected:
-        tags.append("breakout_detection")
-    if vol_confirmed:
-        tags.append("volume_confirmation")
-
-    structure_score = clamp(structure_score, 0, cfg["w_structure"])
-
-    total = trend_score + breakout_score + volume_score + momentum_score + adx_score + structure_score
-
-    # Risk info: nearest support estimate
-    dist_to_support = None
-    if S is not None and S > 0:
-        dist_to_support = (price - S) / price * 100
-
-    return {
-        "price": price,
-        "R": R,
-        "S": S,
-        "EMA200": ema200,
-        "RSI": r,
-        "ADX": a,
-        "ATR": atrv,
-        "ATR%": atrp,
-        "VOL_RATIO": vol_ratio,
-        "score": round(total, 2),
-        "breakout_strength_score": round(clamp(breakout_strength_pct, 0, 10), 2),
-        "tags": ",".join(tags) if tags else "breakout"
-        ,
-        "dist_to_S_%": None if dist_to_support is None else round(dist_to_support, 2),
-        "breakout_above_R_%": round(((price - R) / R) * 100, 2) if R else None
+    meta = {
+        "type": cand_type,
+        "level": level,
+        "distance_atr": distance_atr if cand_type in ("near_break_up",) else None,
+        "compression": is_comp,
+        "compression_width_pct": comp_info["width_pct"] if comp_info else None,
     }
 
-# =========================
-# Main
-# =========================
+    sc = score_candidate(df, cfg, meta)
+    if sc is None:
+        return None
+
+    out = {
+        "symbol": None,  # fill later
+        "score": sc,
+        "type": cand_type,
+        "price": price,
+        "level": level,
+        "atr_pct": float(last["ATR_PCT"]),
+        "rsi": float(last["RSI"]),
+        "vol_ratio": float(last["VOL_RATIO"]),
+        "ema200": float(last["EMA200"]),
+        "compression_width_pct": meta.get("compression_width_pct"),
+    }
+    return out
+
 def main():
-    print("BINANCE SPOT 4H BREAKOUT Tarama Başladı...\n")
+    print("BINANCE SPOT 4H BREAKOUT / SIKIŞMA Tarama Başladı...")
+    exchange = make_exchange()
 
-    exchange = ccxt.binance({"enableRateLimit": True})
-    markets = exchange.load_markets()
-
-    def is_ok(symbol: str) -> bool:
-        m = markets.get(symbol, {})
-        if "/USDT" not in symbol:
-            return False
-        if not m.get("spot", False) or not m.get("active", False):
-            return False
-        if any(x in symbol for x in ("UP/", "DOWN/", "BULL/", "BEAR/")):
-            return False
-        base = symbol.split("/")[0]
-        if base in CONFIG["exclude_bases"]:
-            return False
-        return True
-
-    symbols = [s for s in markets.keys() if is_ok(s)]
-    symbols = symbols[: CONFIG["max_symbols"]]
-
+    err_summary = {"rate_limit_or_network": 0, "binance_block_or_conn": 0, "other_error": 0}
     results = []
-    errors = Counter()
 
-    for sym in symbols:
-        print("Taranıyor:", sym)
+    try:
+        markets = safe_load_markets(exchange)
+    except Exception as e:
+        print("Marketleri yüklerken hata:", str(e))
+        input("Kapatmak için Enter...")
+        return
+
+    # Build USDT spot active pairs
+    symbols = []
+    for s, m in markets.items():
         try:
-            ohlcv = exchange.fetch_ohlcv(sym, timeframe=CONFIG["timeframe"], limit=CONFIG["limit"])
-            if not ohlcv or len(ohlcv) < CONFIG["min_bars"]:
-                errors["insufficient_data"] += 1
+            if "/USDT" in s and m.get("spot") and m.get("active"):
+                # filter leveraged tokens
+                if any(x in s for x in ["UP/", "DOWN/", "BULL/", "BEAR/"]):
+                    continue
+                symbols.append(s)
+        except Exception:
+            continue
+
+    # Optional: sort for stability
+    symbols = sorted(symbols)
+
+    # Limit count
+    symbols = symbols[: CONFIG["max_pairs"]]
+
+    total = len(symbols)
+    for idx, sym in enumerate(symbols, start=1):
+        print(f"Taranıyor: {sym} ({idx}/{total})")
+
+        try:
+            # quick 24h volume filter (if available)
+            try:
+                t = exchange.fetch_ticker(sym)
+                qv = t.get("quoteVolume", None)
+                if qv is not None and float(qv) < CONFIG["min_quote_volume_usdt"]:
+                    time.sleep(CONFIG["sleep_ms"] / 1000)
+                    continue
+            except Exception:
+                # if ticker fails, still try candles
+                pass
+
+            ohlcv = safe_fetch_ohlcv(exchange, sym, CONFIG["timeframe"], CONFIG["limit"])
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            if len(df) < 120:
+                time.sleep(CONFIG["sleep_ms"] / 1000)
                 continue
 
-            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).astype(float)
+            # Ensure numeric
+            for c in ["open", "high", "low", "close", "volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # indicators
-            df["EMA"] = ema(df["close"], CONFIG["ema_trend"])
-            df["RSI"] = rsi(df["close"], CONFIG["rsi_len"])
-            df["ADX"] = wilder_adx(df, CONFIG["adx_len"])
-            df["ATR"] = atr(df, CONFIG["atr_len"])
-            df["ATR_PCT"] = (df["ATR"] / df["close"]) * 100
+            res = analyze_symbol(df, CONFIG)
+            if res:
+                res["symbol"] = sym
+                results.append(res)
 
-            df["VOL_SMA"] = df["volume"].rolling(CONFIG["vol_sma_len"]).mean()
-            df["VOL_RATIO"] = (df["volume"] / df["VOL_SMA"]).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-            # pivots
-            R = last_pivot_resistance(df, CONFIG["pivot_lookback"], CONFIG["pivot_left"], CONFIG["pivot_right"])
-            S = last_pivot_support(df, CONFIG["pivot_lookback"], CONFIG["pivot_left"], CONFIG["pivot_right"])
-
-            cand = score_candidate(df, R, S, CONFIG)
-            if cand:
-                cand["coin"] = sym
-                results.append(cand)
-
-            time.sleep(0.25)
-
-        except ccxt.BaseError:
-            errors["ccxt_error"] += 1
+        except ccxt.RateLimitExceeded:
+            err_summary["rate_limit_or_network"] += 1
+            time.sleep(2.0)
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout):
+            err_summary["rate_limit_or_network"] += 1
+            time.sleep(1.5)
+        except ccxt.ExchangeError:
+            err_summary["binance_block_or_conn"] += 1
+            time.sleep(1.0)
         except Exception:
-            errors["other_error"] += 1
+            err_summary["other_error"] += 1
 
+        time.sleep(CONFIG["sleep_ms"] / 1000)
+
+    # Sort by score desc
     results = sorted(results, key=lambda x: x["score"], reverse=True)
 
-    print("\nEN GÜÇLÜ BREAKOUT ADAYLARI (Top 5):\n")
-    for r in results[:5]:
-        print(f"{r['coin']} | SCORE: {r['score']} | Price: {r['price']}")
-        print(f"R: {r['R']} | S: {r['S']} | breakout%: {r['breakout_above_R_%']} | distS%: {r['dist_to_S_%']}")
-        print(f"RSI: {r['RSI']} | ADX: {r['ADX']} | ATR%: {r['ATR%']} | VOLx: {r['VOL_RATIO']} | strength: {r['breakout_strength_score']}")
-        print(f"TAGS: {r['tags']}")
-        print("-"*40)
+    print("\n" + "=" * 60)
+    print(f"EN GÜÇLÜ ADAYLAR (Top {CONFIG['top_n']}):")
+    if not results:
+        print("Uygun aday bulunamadı.")
+    else:
+        top = results[: CONFIG["top_n"]]
+        for i, r in enumerate(top, start=1):
+            print(
+                f"{i:02d}. {r['symbol']:12}  score={r['score']:3d}  "
+                f"type={r['type']:<16}  rsi={r['rsi']:.1f}  atr%={r['atr_pct']:.2f}  volR={r['vol_ratio']:.2f}"
+            )
 
-    if results:
-        best = results[0]
-        print("\n✅ EN YÜKSEK SKORLU ADAY:")
-        print(best)
+    if CONFIG["save_csv"]:
+        try:
+            df_out = pd.DataFrame(results)
+            df_out["ts"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            df_out.to_csv(CONFIG["csv_name"], index=False)
+            print(f"\nCSV kaydedildi: {CONFIG['csv_name']}")
+        except Exception as e:
+            print("CSV yazma hatası:", str(e))
 
-        # CSV export
-        out = pd.DataFrame(results)
-        out.to_csv("breakout_results_4h.csv", index=False)
-        print("\nCSV kaydedildi: breakout_results_4h.csv")
-
-    if errors:
-        print("\nHata özeti:", dict(errors))
+    print(f"\nHata özeti: {err_summary}")
+    print("=" * 60)
+    input("Bitirdi. Kapatmak için Enter...")
 
 if __name__ == "__main__":
     main()
