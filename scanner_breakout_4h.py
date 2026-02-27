@@ -172,6 +172,53 @@ def detect_flag_channel(df: pd.DataFrame, impulse_bars: int = 12, cons_bars: int
 
     return (imp_move > 6.0) and (cons_width < 6.0)
 
+def detect_channel_breakout(df: pd.DataFrame, window: int = 50):
+    """Yükselen/alçalan paralel kanal dışına kırılım."""
+    if len(df) < window + 2:
+        return False, None
+
+    sub = df.iloc[-(window + 1):-1]
+    ch_high = float(sub["high"].max())
+    ch_low = float(sub["low"].min())
+    last_close = float(df["close"].iloc[-1])
+
+    channel_width_pct = ((ch_high - ch_low) / ((ch_high + ch_low) / 2)) * 100 if (ch_high + ch_low) != 0 else 999
+    if channel_width_pct > 12:
+        return False, None
+
+    if last_close > ch_high:
+        return True, "channel_breakout_up"
+    if last_close < ch_low:
+        return True, "channel_breakout_down"
+    return False, None
+
+def detect_range_breakout(df: pd.DataFrame, window: int = 60):
+    """Dar banttan çıkış (range breakout)."""
+    if len(df) < window + 2:
+        return False, None, None, None
+
+    sub = df.iloc[-(window + 1):-1]
+    hi = float(sub["high"].max())
+    lo = float(sub["low"].min())
+    mid = (hi + lo) / 2
+    width_pct = ((hi - lo) / mid) * 100 if mid else 999
+    last_close = float(df["close"].iloc[-1])
+
+    if width_pct > 8.0:
+        return False, None, hi, lo
+
+    if last_close > hi:
+        return True, "range_breakout_up", hi, lo
+    if last_close < lo:
+        return True, "range_breakout_down", hi, lo
+
+    return False, None, hi, lo
+
+def volume_confirmation(df: pd.DataFrame, min_ratio: float):
+    if "VOL_RATIO" not in df.columns:
+        return False
+    return float(df["VOL_RATIO"].iloc[-1]) >= min_ratio
+
 # =========================
 # Scoring
 # =========================
@@ -208,19 +255,33 @@ def score_candidate(df: pd.DataFrame, R: float, S: float, cfg=CONFIG):
         return None
 
     breakout_thresh = R + (atrv * cfg["breakout_atr_mult"])
-    is_breakout = price > breakout_thresh
+    breakout_detected = price > breakout_thresh
 
-    if not is_breakout:
+    tri = detect_triangle(df, lookback=80, left=cfg["pivot_left"], right=cfg["pivot_right"])
+    flag = detect_flag_channel(df)
+    ch_break, ch_tag = detect_channel_breakout(df, window=50)
+    range_break, range_tag, range_hi, range_lo = detect_range_breakout(df, window=60)
+
+    if not (breakout_detected or ch_break or range_break):
         return None
 
-    if vol_ratio < cfg["min_vol_ratio"]:
+    vol_confirmed = volume_confirmation(df, cfg["min_vol_ratio"])
+    if not vol_confirmed:
         return None
 
     # Scores (0..weight)
     trend_score = clamp(((price - ema200) / ema200) * 100, 0, 6) / 6 * cfg["w_trend"]
 
     # breakout ne kadar güçlü (R üstünde ne kadar)
-    breakout_strength_pct = ((price - R) / R) * 100 if R else 0
+    breakout_refs = []
+    if R:
+        breakout_refs.append(((price - R) / R) * 100)
+    if range_hi:
+        breakout_refs.append(((price - range_hi) / range_hi) * 100)
+    if ch_break and df.iloc[-2]["high"] > 0:
+        prior_high = float(df.iloc[-2]["high"])
+        breakout_refs.append(((price - prior_high) / prior_high) * 100)
+    breakout_strength_pct = max(breakout_refs) if breakout_refs else 0
     breakout_score = clamp(breakout_strength_pct, 0, 4) / 4 * cfg["w_breakout"]
 
     volume_score = clamp(vol_ratio, 1.0, 3.0)
@@ -233,19 +294,24 @@ def score_candidate(df: pd.DataFrame, R: float, S: float, cfg=CONFIG):
     adx_score = clamp(a, cfg["adx_min"], 35)
     adx_score = (adx_score - cfg["adx_min"]) / (35 - cfg["adx_min"]) * cfg["w_adx"]
 
-    # Structure: triangle / flag / range etiketi (kırılımla birlikte)
-    tri = detect_triangle(df, lookback=80, left=cfg["pivot_left"], right=cfg["pivot_right"])
-    flag = detect_flag_channel(df)
-    rng = detect_range(df, window=60)
-
+    # Structure: triangle / flag / channel / range
     structure_score = 0
     tags = []
     if tri:
-        structure_score += 0.8 * cfg["w_structure"]; tags.append("triangle_break")
+        structure_score += 0.6 * cfg["w_structure"]; tags.append("triangle_pattern")
     if flag:
-        structure_score += 0.8 * cfg["w_structure"]; tags.append("flag/channel_break")
-    if rng:
-        tags.append("range/ara-alan")
+        structure_score += 0.6 * cfg["w_structure"]; tags.append("flag_pattern")
+    if ch_break and ch_tag:
+        structure_score += 0.7 * cfg["w_structure"]; tags.append(ch_tag)
+    if range_break and range_tag:
+        structure_score += 0.7 * cfg["w_structure"]; tags.append(range_tag)
+    elif detect_range(df, window=60):
+        tags.append("range_pattern")
+
+    if breakout_detected:
+        tags.append("breakout_detection")
+    if vol_confirmed:
+        tags.append("volume_confirmation")
 
     structure_score = clamp(structure_score, 0, cfg["w_structure"])
 
@@ -267,6 +333,7 @@ def score_candidate(df: pd.DataFrame, R: float, S: float, cfg=CONFIG):
         "ATR%": atrp,
         "VOL_RATIO": vol_ratio,
         "score": round(total, 2),
+        "breakout_strength_score": round(clamp(breakout_strength_pct, 0, 10), 2),
         "tags": ",".join(tags) if tags else "breakout"
         ,
         "dist_to_S_%": None if dist_to_support is None else round(dist_to_support, 2),
@@ -339,11 +406,11 @@ def main():
 
     results = sorted(results, key=lambda x: x["score"], reverse=True)
 
-    print("\nEN GÜÇLÜ BREAKOUT ADAYLARI (Top 15):\n")
-    for r in results[:15]:
+    print("\nEN GÜÇLÜ BREAKOUT ADAYLARI (Top 5):\n")
+    for r in results[:5]:
         print(f"{r['coin']} | SCORE: {r['score']} | Price: {r['price']}")
         print(f"R: {r['R']} | S: {r['S']} | breakout%: {r['breakout_above_R_%']} | distS%: {r['dist_to_S_%']}")
-        print(f"RSI: {r['RSI']} | ADX: {r['ADX']} | ATR%: {r['ATR%']} | VOLx: {r['VOL_RATIO']}")
+        print(f"RSI: {r['RSI']} | ADX: {r['ADX']} | ATR%: {r['ATR%']} | VOLx: {r['VOL_RATIO']} | strength: {r['breakout_strength_score']}")
         print(f"TAGS: {r['tags']}")
         print("-"*40)
 
